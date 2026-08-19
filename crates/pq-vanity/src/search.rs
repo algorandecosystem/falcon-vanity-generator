@@ -23,6 +23,9 @@ pub const BASE32_ALPHABET: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
 #[derive(Clone)]
 pub struct SearchConfig {
+    /// Multi-source entropy mixer (see `entropy.rs`); cached TPM/jitter
+    /// contributions are refreshed only after an emitted hit.
+    pub mix: Arc<crate::entropy::EntropyMix>,
     /// Uppercased, validated prefix to match against the displayed address.
     pub prefix: Option<String>,
     /// Uppercased, validated suffix.
@@ -125,12 +128,14 @@ pub fn run(cfg: SearchConfig) -> anyhow::Result<u64> {
 }
 
 fn worker(cfg: &SearchConfig, counters: &Counters, io_lock: &Mutex<()>) {
-    let mut entropy = [0u8; ENTROPY_SIZE];
     while !counters.stop.load(Ordering::Relaxed) {
-        if getrandom::getrandom(&mut entropy).is_err() {
-            counters.stop.store(true, Ordering::Relaxed);
-            return;
-        }
+        let entropy = match cfg.mix.next() {
+            Ok(e) => e,
+            Err(_) => {
+                counters.stop.store(true, Ordering::Relaxed);
+                return;
+            }
+        };
         let seed = keygen_seed_from_entropy(&entropy);
         let kp = match keygen_from_seed(&seed) {
             Ok(kp) => kp,
@@ -185,10 +190,14 @@ fn record_hit(
         .is_ok();
 
     let _guard = io_lock.lock().unwrap();
-    let path = write_hit_record(&cfg.out_dir, entropy, salt, addr, kp);
+    let path = write_hit_record(&cfg.out_dir, entropy, salt, addr, kp, cfg.mix.sources());
     print_hit(n + 1, entropy, salt, addr, kp, roundtrip, path.as_deref());
     if n + 1 >= cfg.count as u64 {
         counters.stop.store(true, Ordering::Relaxed);
+    } else {
+        // Re-request the cached contributions (TPM + jitter) so the next hit
+        // never shares them with this one; between hits they stay static.
+        cfg.mix.refresh();
     }
 }
 
@@ -201,6 +210,7 @@ pub fn write_hit_record(
     salt: u8,
     addr: &Address,
     kp: &Keypair,
+    entropy_sources: &str,
 ) -> Option<PathBuf> {
     let display = addr.to_address_string();
     let mnemonic = key_to_mnemonic(entropy);
@@ -218,6 +228,7 @@ pub fn write_hit_record(
          pubkey (base64):   {pk}\n\
          entropy (hex):     {ent}  # KEEP SECRET\n\
          mnemonic:          {mnemonic}  # KEEP SECRET\n\
+         entropy sources:   {entropy_sources}\n\
          \n\
          # import: algokey pq import -m \"<mnemonic>\" -k <keyfile>\n\
          # note: algokey signs with the canonical salt; a non-canonical salt\n\

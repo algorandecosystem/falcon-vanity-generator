@@ -8,6 +8,7 @@
 //!   - `gpu`     — CUDA throughput search
 //!   - `gpu-selftest` — validate the device pipeline against the CPU oracle
 
+mod entropy;
 mod search;
 
 use std::path::PathBuf;
@@ -89,6 +90,10 @@ struct SearchArgs {
     /// Directory for emitted hit record files (address, salt, mnemonic).
     #[arg(long, default_value = "./hits")]
     out: PathBuf,
+    /// Extra entropy mixed into every generated seed (defense in depth): a
+    /// file path if it names an existing file, otherwise the literal string.
+    #[arg(long)]
+    extra_entropy: Option<String>,
     /// Suppress the per-second progress line.
     #[arg(long, default_value_t = false)]
     quiet: bool,
@@ -142,6 +147,10 @@ struct GpuArgs {
     /// Directory for emitted hit record files (address, salt, mnemonic).
     #[arg(long, default_value = "./hits")]
     out: PathBuf,
+    /// Extra entropy mixed into every batch base seed (defense in depth): a
+    /// file path if it names an existing file, otherwise the literal string.
+    #[arg(long)]
+    extra_entropy: Option<String>,
     /// Stop after this many GPU batches (0 = unlimited). Use for benchmarking.
     #[arg(long, default_value_t = 0)]
     batches: u64,
@@ -434,14 +443,20 @@ fn cmd_gpu(a: GpuArgs) -> anyhow::Result<()> {
             pq_cuda::device_count()
         );
 
+        let mix = entropy::EntropyMix::new(load_extra_entropy(&a.extra_entropy)?.as_deref());
+        eprintln!("entropy sources: {}", mix.sources());
+
         let start = std::time::Instant::now();
         let mut found = 0usize;
         let mut raw_hits = 0u64;
         let mut keys_done = 0u128;
         for batch in 0u64.. {
-            let mut base_entropy = [0u8; pq_cuda::ENTROPY_SIZE];
-            getrandom::getrandom(&mut base_entropy)
-                .map_err(|e| anyhow::anyhow!("getrandom failed: {e}"))?;
+            if batch > 0 {
+                // Fresh cached contributions (TPM + jitter) for every batch;
+                // batches are seconds apart, so the ms-scale TPM read is free.
+                mix.refresh();
+            }
+            let base_entropy = mix.next()?;
             let res =
                 pq_cuda::search_batch(&base_entropy, 0, a.items, max_salt, &indices, a.max_hits)?;
             raw_hits += res.hits.len() as u64;
@@ -454,8 +469,14 @@ fn cmd_gpu(a: GpuArgs) -> anyhow::Result<()> {
                 .into_iter()
                 .flatten()
             {
-                let path =
-                    search::write_hit_record(&a.out, &v.entropy, v.salt, &v.addr, &v.kp);
+                let path = search::write_hit_record(
+                    &a.out,
+                    &v.entropy,
+                    v.salt,
+                    &v.addr,
+                    &v.kp,
+                    mix.sources(),
+                );
                 found += 1;
                 search::print_hit(
                     found as u64,
@@ -492,6 +513,20 @@ fn cmd_gpu(a: GpuArgs) -> anyhow::Result<()> {
         );
         Ok(())
     }
+}
+
+/// Resolve `--extra-entropy`: a path if it names an existing file, otherwise
+/// the literal string bytes.
+fn load_extra_entropy(arg: &Option<String>) -> anyhow::Result<Option<Vec<u8>>> {
+    let Some(v) = arg else { return Ok(None) };
+    let p = std::path::Path::new(v);
+    let bytes = if p.is_file() {
+        std::fs::read(p).map_err(|e| anyhow::anyhow!("--extra-entropy file {v}: {e}"))?
+    } else {
+        v.clone().into_bytes()
+    };
+    anyhow::ensure!(!bytes.is_empty(), "--extra-entropy is empty");
+    Ok(Some(bytes))
 }
 
 fn parse_hex(s: &str) -> anyhow::Result<Vec<u8>> {
@@ -584,7 +619,13 @@ fn cmd_search(a: SearchArgs) -> anyhow::Result<()> {
         );
     }
 
+    let mix = Arc::new(entropy::EntropyMix::new(
+        load_extra_entropy(&a.extra_entropy)?.as_deref(),
+    ));
+    eprintln!("entropy sources: {}", mix.sources());
+
     let cfg = search::SearchConfig {
+        mix,
         prefix,
         suffix,
         max_salt: a.max_salt,
