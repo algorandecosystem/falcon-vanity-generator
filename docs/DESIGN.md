@@ -277,16 +277,26 @@ numbers are device-relative):
   (the sampler/NTT want the registers for ILP); block-size tuning (within
   noise; `PQ_GPU_BLOCK`); a squared-norm pre-filter to skip keygen-doomed
   `(f,g)` — **warp lockstep** means skipping lanes doesn't shorten the warp.
+- **Entropy (implemented):** every generated seed is SHA-512/256 over
+  independent sources — `getrandom` (mandatory), the CPU DRNG (RDSEED /
+  RNDR), timing jitter, TPM 2.0 (raw `TPM2_GetRandom` on `/dev/tpmrm0`), and
+  optional `--extra-entropy` (`crates/pq-vanity/src/entropy.rs`); the live
+  set is printed at startup and recorded in each hit file. Cached
+  contributions (TPM + jitter) refresh per GPU batch; the CPU search keeps
+  them static and re-requests only after each emitted hit. The GPU also emits
+  **at most one hit per batch** (same-batch keys share the 24-byte base
+  entropy; `--allow-sibling-hits` restores multi-hit batches), and the device
+  counter starts at the base's own bytes `[24..32]` wrapping mod 2^64, so
+  emitted entropies are uniform — no zero-suffix fingerprint. The one-hit
+  cost equals the same-batch hit probability (`1-(1-e^-λ)/λ`,
+  λ = items·0.052/32^L): ~85% at 3-char prefixes, ~10% at 4, <0.5% at ≥5,
+  and zero with `--count 1`.
 - Remaining backlog (the sampler+NTT is the wall — the kernel is
   latency-bound at ~25% occupancy with a large per-thread local working set):
   a **cooperative warp-per-key kernel with the NTT in shared memory** (biggest
   lever; also unlocks the retry/compaction wins above, theoretical ~1.6× floor
   over first-sample scanning); in-kernel off-curve; multi-GPU;
-  suffix/contains patterns; **entropy hygiene**: accept at most one verified
-  hit per GPU batch (batches already re-randomize `base_entropy`), so no two
-  emitted keys ever share the 24-byte base — throughput cost equals the
-  same-batch hit probability (`1-(1-e^-λ)/λ`, λ = items·0.052/32^L): ~85% at
-  3-char prefixes, ~10% at 4, <0.5% at ≥5, and zero with `--count 1`.
+  suffix/contains patterns.
 
 > nvcc 13 `-O3` miscompiled a `for(;;)`+`continue`/`break` rejection-sampling
 > loop (stored one element past the buffer); use `do { } while(...)` in device

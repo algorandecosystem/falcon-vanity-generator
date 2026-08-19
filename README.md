@@ -134,7 +134,7 @@ full keygen per key, so every CPU key is usable).
 One algokey-ready candidate address per usable key. Expected time to a hit for
 an `L`-character prefix ≈ `32^L / candidates_per_second`.
 
-`pq-vanity gpu --prefix ALG --batches 4 --count 9999 --max-hits 16384`
+`pq-vanity gpu --prefix ALG --batches 4 --count 9999 --max-hits 16384 --allow-sibling-hits`
 
 | Device | keys/s | usable candidates/s | measured `ALG` (3-char) hits | est. 5-char hit |
 |---|---|---|---|---|
@@ -152,7 +152,7 @@ an `L`-character prefix ≈ `32^L / candidates_per_second`.
 Up to 256 addresses per usable key (salts swept on-device); hits at any
 compliant salt. Expected addresses examined per usable hit ≈ `32^(L+1)`.
 
-`pq-vanity gpu --prefix ALGO --allow-non-canonical --batches 3 --count 9999`
+`pq-vanity gpu --prefix ALGO --allow-non-canonical --batches 3 --count 9999 --allow-sibling-hits`
 
 | Device | keys/s | addresses/s | measured `ALGO` (4-char) hits |
 |---|---|---|---|
@@ -172,10 +172,24 @@ one), trading raw address throughput for hits that stock algokey can sign.
 ## Security
 
 A matched key is a full-entropy valid Falcon key; vanity search only *selects*
-among valid keys and does not weaken them. Keep entropy CSPRNG-quality and
-never commit mnemonics/keys — the repo's `.gitignore` excludes `hits/`, `out/`,
-and key files, and hit records are written only to the `--out` directory you
-choose. Treat every `.pqhit` file as a secret: it contains the mnemonic.
+among valid keys and does not weaken them. Never commit mnemonics/keys — the
+repo's `.gitignore` excludes `hits/`, `out/`, and key files, and hit records
+are written only to the `--out` directory you choose. Treat every `.pqhit`
+file as a secret: it contains the mnemonic.
+
+Seed entropy is mixed from multiple independent sources with SHA-512/256: the
+OS CSPRNG (`getrandom`, mandatory), the CPU DRNG (`RDSEED` on x86-64 / `RNDR`
+on aarch64), timing jitter, a TPM 2.0 (`/dev/tpmrm0`) when present, and
+optional user input (`--extra-entropy <file|string>`) — the mix is
+unpredictable as long as *any one* source is. Missing sources are skipped; the
+live set is printed at startup and recorded in each hit file. The GPU re-draws
+the cached sources (TPM, jitter) every batch and by default emits **at most
+one hit per GPU batch**, because same-batch keys share 24 of their 32
+base-entropy bytes (`--allow-sibling-hits` accepts them anyway — they are
+full-strength keys, just not independent of each other). The per-batch
+counter starts at a random offset and wraps mod 2^64, so every emitted
+entropy is uniformly distributed — no zero-suffix pattern fingerprints the
+generator. The CPU search re-draws the cached sources after every hit.
 
 ## License
 

@@ -151,6 +151,12 @@ struct GpuArgs {
     /// file path if it names an existing file, otherwise the literal string.
     #[arg(long)]
     extra_entropy: Option<String>,
+    /// Accept more than one verified hit from the same GPU batch. Same-batch
+    /// keys share the 24-byte base entropy (only the 8 counter bytes differ),
+    /// so by default at most one hit per batch is emitted and later ones are
+    /// discarded — free with --count 1, negligible for prefixes of 5+ chars.
+    #[arg(long, default_value_t = false)]
+    allow_sibling_hits: bool,
     /// Stop after this many GPU batches (0 = unlimited). Use for benchmarking.
     #[arg(long, default_value_t = 0)]
     batches: u64,
@@ -450,6 +456,7 @@ fn cmd_gpu(a: GpuArgs) -> anyhow::Result<()> {
         let mut found = 0usize;
         let mut raw_hits = 0u64;
         let mut keys_done = 0u128;
+        let mut siblings_discarded = 0u64;
         for batch in 0u64.. {
             if batch > 0 {
                 // Fresh cached contributions (TPM + jitter) for every batch;
@@ -457,18 +464,37 @@ fn cmd_gpu(a: GpuArgs) -> anyhow::Result<()> {
                 mix.refresh();
             }
             let base_entropy = mix.next()?;
-            let res =
-                pq_cuda::search_batch(&base_entropy, 0, a.items, max_salt, &indices, a.max_hits)?;
+            // Full 256-bit unpredictability: the per-thread counter starts at
+            // the base's own bytes [24..32] (LE) and wraps mod 2^64 (thread 0
+            // gets the mix output verbatim), so emitted entropies carry no
+            // zero-suffix fingerprint. Siblings are still counter-adjacent —
+            // independence comes from one-hit-per-batch, not from this.
+            let start_counter = u64::from_le_bytes(base_entropy[24..32].try_into().unwrap());
+            let res = pq_cuda::search_batch(
+                &base_entropy,
+                start_counter,
+                a.items,
+                max_salt,
+                &indices,
+                a.max_hits,
+            )?;
             raw_hits += res.hits.len() as u64;
             keys_done += a.items as u128;
 
             // Verify raw hits on all cores: completing a key (NTRU solve) costs
             // ~2ms, and short prefixes can return thousands of raw hits per
             // batch — serial verification would throttle the (fast) kernel.
+            let mut batch_emitted = 0usize;
             for v in verify_hits(&res.hits, &prefix, canonical_only)
                 .into_iter()
                 .flatten()
             {
+                // Same-batch keys share the 24-byte base entropy; emit at most
+                // one per batch so every reported key is independent.
+                if !a.allow_sibling_hits && batch_emitted >= 1 {
+                    siblings_discarded += 1;
+                    continue;
+                }
                 let path = search::write_hit_record(
                     &a.out,
                     &v.entropy,
@@ -478,6 +504,7 @@ fn cmd_gpu(a: GpuArgs) -> anyhow::Result<()> {
                     mix.sources(),
                 );
                 found += 1;
+                batch_emitted += 1;
                 search::print_hit(
                     found as u64,
                     &v.entropy,
@@ -506,6 +533,12 @@ fn cmd_gpu(a: GpuArgs) -> anyhow::Result<()> {
                 eprintln!("(stopped after {} batch(es) — benchmark mode)", a.batches);
                 break;
             }
+        }
+        if siblings_discarded > 0 {
+            eprintln!(
+                "note: discarded {siblings_discarded} additional same-batch hit(s) \
+                 (entropy hygiene — pass --allow-sibling-hits to keep them)"
+            );
         }
         eprintln!(
             "done: {found} usable address(es) in {:.1}s",
