@@ -282,7 +282,11 @@ numbers are device-relative):
   a **cooperative warp-per-key kernel with the NTT in shared memory** (biggest
   lever; also unlocks the retry/compaction wins above, theoretical ~1.6× floor
   over first-sample scanning); in-kernel off-curve; multi-GPU;
-  suffix/contains patterns.
+  suffix/contains patterns; **entropy hygiene**: accept at most one verified
+  hit per GPU batch (batches already re-randomize `base_entropy`), so no two
+  emitted keys ever share the 24-byte base — throughput cost equals the
+  same-batch hit probability (`1-(1-e^-λ)/λ`, λ = items·0.052/32^L): ~85% at
+  3-char prefixes, ~10% at 4, <0.5% at ≥5, and zero with `--count 1`.
 
 > nvcc 13 `-O3` miscompiled a `for(;;)`+`continue`/`break` rejection-sampling
 > loop (stored one element past the buffer); use `do { } while(...)` in device
