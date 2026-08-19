@@ -1,0 +1,24 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# CUDA / build artifacts
+*.ptx
+*.cubin
+*.fatbin
+*.o
+*.obj
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Local scratch — generated keys/hits must NEVER be committed
+/out
+/hits
+*.algokey
+*.algokey-pq
+/scratch

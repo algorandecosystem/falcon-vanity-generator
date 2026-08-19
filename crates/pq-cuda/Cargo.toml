@@ -1,0 +1,20 @@
+[package]
+name = "pq-cuda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "CUDA backend for pq-vanity: device-side Falcon-1024 public-half + PQ address search (sm_120 / sm_121a)."
+build = "build.rs"
+
+[lib]
+name = "pq_cuda"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Compile and link the CUDA kernel. Requires nvcc on PATH (or CUDA_PATH set).
+# Without this feature the crate builds a host-only stub.
+cuda = []

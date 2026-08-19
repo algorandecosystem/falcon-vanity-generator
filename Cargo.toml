@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = ["crates/pq-core", "crates/pq-vanity", "crates/pq-cuda"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/urtho/falcon-vanity-generator"
+authors = ["urtho <urtho@algonode.io>"]
+rust-version = "1.80"
+
+# Optimize the release profile hard: this is a throughput-bound search tool.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+# A profile for the CPU search baseline that keeps panics unwinding (tests/dev).
+[profile.bench]
+opt-level = 3
+lto = "thin"

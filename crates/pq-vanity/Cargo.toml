@@ -1,0 +1,26 @@
+[package]
+name = "pq-vanity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "GPU-accelerated vanity address generator for Algorand native post-quantum (f1 / Falcon-1024) accounts."
+
+[[bin]]
+name = "pq-vanity"
+path = "src/main.rs"
+
+[dependencies]
+pq-core = { path = "../pq-core" }
+pq-cuda = { path = "../pq-cuda", optional = true }
+clap = { version = "4.5", features = ["derive"] }
+getrandom = "0.2"
+base64 = "0.22"
+anyhow = "1"
+
+[features]
+default = []
+# Enables the CUDA backend (requires nvcc; targets sm_120 + sm_121a).
+cuda = ["dep:pq-cuda", "pq-cuda/cuda"]

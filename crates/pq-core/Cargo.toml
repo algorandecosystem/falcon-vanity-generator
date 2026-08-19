@@ -1,0 +1,26 @@
+[package]
+name = "pq-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Byte-exact derivation of Algorand native post-quantum (Falcon-1024 / f1) account addresses, plus the vendored Falcon reference keygen oracle."
+
+[lib]
+name = "pq_core"
+path = "src/lib.rs"
+
+[dependencies]
+# Address derivation
+sha2 = "0.10"            # provides Sha512_256 (truncated SHA-512/256), matches crypto.Hash
+data-encoding = "2.6"   # BASE32_NOPAD == Go base32.StdEncoding.WithPadding(NoPadding)
+# Off-curve (IsPQCompliant) predicate
+curve25519-dalek = "4.1"
+
+[build-dependencies]
+cc = "1.1"
+
+[dev-dependencies]
+hex = "0.4"
