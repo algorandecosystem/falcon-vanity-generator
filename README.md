@@ -123,7 +123,7 @@ faster), **but be aware what you are buying**:
 
 ## Benchmarks
 
-Measured with the commands shown below on four GPUs (single GPU each) and two
+Measured with the commands shown below on four GPUs (single GPU each) and four
 CPUs. Keys/s counts candidate Falcon keys scanned; a "candidate" becomes usable
 only if the reference keygen accepts it (~5.2% of first samples — the GPU
 scans fresh seeds and lets the CPU host verify hits; the CPU baseline runs the
@@ -142,6 +142,8 @@ an `L`-character prefix ≈ `32^L / candidates_per_second`.
 | NVIDIA RTX PRO 4500 Blackwell | 1.31 M | ~68 k | 24 in 12.8 s | ~8 min |
 | NVIDIA GeForce RTX 5070 | 0.87 M | ~45 k | 40 in 19.3 s | ~12 min |
 | NVIDIA GB10 (DGX Spark) | 0.78 M | ~41 k | 17 in 21.4 s | ~14 min |
+| CPU (Ryzen 9 9950X, 31 threads, `search`) | 806 | 806 | — | ~12 h |
+| CPU (Ryzen 9 7950X, 31 threads, `search`) | 718 | 718 | — | ~13 h |
 | CPU (Xeon Gold 5412U, 47 threads, `search`) | 694 | 694 | — | ~13 h |
 | CPU (i7-10700, 15 threads, `search`) | 236 | 236 | — | ~39 h |
 
@@ -158,6 +160,8 @@ compliant salt. Expected addresses examined per usable hit ≈ `32^(L+1)`.
 | NVIDIA RTX PRO 4500 Blackwell | 0.57 M | 146 M | 101 in 22.1 s |
 | NVIDIA GeForce RTX 5070 | 0.37 M | 95.5 M | 93 in 33.7 s |
 | NVIDIA GB10 (DGX Spark) | 0.30 M | 76.9 M | 96 in 41.9 s |
+| CPU (Ryzen 9 9950X, 31 threads, `search`) | ~806 | ~206 k | — |
+| CPU (Ryzen 9 7950X, 31 threads, `search`) | ~718 | ~184 k | — |
 | CPU (Xeon Gold 5412U, 47 threads, `search`) | ~694 | ~178 k | — |
 | CPU (i7-10700, 15 threads, `search`) | ~236 | ~60 k | — |
 
