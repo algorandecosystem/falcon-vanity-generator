@@ -123,8 +123,8 @@ faster), **but be aware what you are buying**:
 
 ## Benchmarks
 
-Measured with the commands shown below on three GPUs (single GPU each) and one
-CPU. Keys/s counts candidate Falcon keys scanned; a "candidate" becomes usable
+Measured with the commands shown below on four GPUs (single GPU each) and two
+CPUs. Keys/s counts candidate Falcon keys scanned; a "candidate" becomes usable
 only if the reference keygen accepts it (~5.2% of first samples — the GPU
 scans fresh seeds and lets the CPU host verify hits; the CPU baseline runs the
 full keygen per key, so every CPU key is usable).
@@ -139,8 +139,10 @@ an `L`-character prefix ≈ `32^L / candidates_per_second`.
 | Device | keys/s | usable candidates/s | measured `ALG` (3-char) hits | est. 5-char hit |
 |---|---|---|---|---|
 | NVIDIA RTX PRO 6000 Blackwell (Max-Q) | 2.40 M | ~125 k | 33 in 7.0 s | ~4.5 min |
+| NVIDIA RTX PRO 4500 Blackwell | 1.31 M | ~68 k | 24 in 12.8 s | ~8 min |
 | NVIDIA GeForce RTX 5070 | 0.87 M | ~45 k | 40 in 19.3 s | ~12 min |
 | NVIDIA GB10 (DGX Spark) | 0.78 M | ~41 k | 17 in 21.4 s | ~14 min |
+| CPU (Xeon Gold 5412U, 47 threads, `search`) | 694 | 694 | — | ~13 h |
 | CPU (i7-10700, 15 threads, `search`) | 236 | 236 | — | ~39 h |
 
 ### Non-canonical mode (`--allow-non-canonical`)
@@ -153,8 +155,10 @@ compliant salt. Expected addresses examined per usable hit ≈ `32^(L+1)`.
 | Device | keys/s | addresses/s | measured `ALGO` (4-char) hits |
 |---|---|---|---|
 | NVIDIA RTX PRO 6000 Blackwell (Max-Q) | 1.03 M | 263 M | 91 in 12.2 s |
+| NVIDIA RTX PRO 4500 Blackwell | 0.57 M | 146 M | 101 in 22.1 s |
 | NVIDIA GeForce RTX 5070 | 0.37 M | 95.5 M | 93 in 33.7 s |
 | NVIDIA GB10 (DGX Spark) | 0.30 M | 76.9 M | 96 in 41.9 s |
+| CPU (Xeon Gold 5412U, 47 threads, `search`) | ~694 | ~178 k | — |
 | CPU (i7-10700, 15 threads, `search`) | ~236 | ~60 k | — |
 
 Canonical mode reports lower addresses/s by design: it only ever checks one
