@@ -68,6 +68,34 @@ need a one-time fix: `make patch-cuda-rsqrt`. Other architectures can be added
 with `make build-cuda ARCHS=<list>` — the kernel is integer + FP32 only and
 does not depend on Blackwell features.
 
+### GPU memory
+
+Memory use depends on the GPU's size, not on the search: seeds are derived
+on-device, the hit buffer is ~135 KB and the target table a fixed 32 KB, so
+`--items`, the pattern, and the number of targets make no difference. Almost
+all of it is per-thread stack, which CUDA reserves for every thread that can
+be resident at once (1,536 per SM):
+
+```
+memory ≈ 94 MiB (CUDA context) + stack_per_thread × SMs × 1536
+  ed25519 search kernel: 2,960 B/thread → ~4.3 MiB per SM
+  f1 search kernel:      8,304 B/thread → ~12.2 MiB per SM
+```
+
+| GPU | SMs | ed25519 | f1 |
+|---|---|---|---|
+| GeForce RTX 5070 (measured) | 48 | 302 MiB | 678 MiB |
+| GB10 (DGX Spark) | 48 | ~0.3 GB | ~0.7 GB |
+| RTX PRO 4500 Blackwell | 82 | ~0.45 GB | ~1.1 GB |
+| RTX PRO 6000 Blackwell | 188 | ~0.9 GB | ~2.4 GB |
+
+Rows other than the RTX 5070 are computed from the formula. On a GPU shared
+with another process, keep that much **free** memory: a run that cannot get
+it fails with `CUDA runtime error (code -2)` (`cudaErrorMemoryAllocation`).
+For example, a vLLM server claims a fixed share of the GPU at startup
+(`--gpu-memory-utilization`, often 0.9 or more) and holds it while idle;
+`nvidia-smi` shows what is free.
+
 ## Usage
 
 ```bash
