@@ -1,5 +1,6 @@
 //! `pq-vanity` — vanity address generator for Algorand native post-quantum
-//! (`f1` / Deterministic Falcon-1024) accounts.
+//! (`f1` / Deterministic Falcon-1024) accounts, and — with `--scheme ed25519`
+//! — classic Algorand (Ed25519) accounts.
 //!
 //! Subcommands:
 //!   - `derive`  — derive the address for mnemonic entropy (KAT sanity check)
@@ -8,8 +9,10 @@
 //!   - `gpu`     — CUDA throughput search
 //!   - `gpu-selftest` — validate the device pipeline against the CPU oracle
 
+mod classic;
 mod entropy;
 mod search;
+mod targets;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -27,7 +30,7 @@ use pq_core::{
 #[command(
     name = "pq-vanity",
     version,
-    about = "Vanity address generator for Algorand native post-quantum (f1 / Falcon-1024) accounts"
+    about = "Vanity address generator for Algorand accounts: native post-quantum (f1 / Falcon-1024) or classic (Ed25519)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -48,8 +51,21 @@ enum Cmd {
     GpuSelftest(GpuSelftestArgs),
 }
 
+/// Account signature scheme.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
+pub enum Scheme {
+    /// Native post-quantum account (Deterministic Falcon-1024).
+    F1,
+    /// Classic Algorand account (Ed25519; the address is the public key).
+    #[value(alias = "classic")]
+    Ed25519,
+}
+
 #[derive(clap::Args)]
 struct DeriveArgs {
+    /// Account scheme.
+    #[arg(long, value_enum, default_value_t = Scheme::F1)]
+    scheme: Scheme,
     /// First entropy byte (rest zero) of the 32-byte mnemonic entropy.
     #[arg(long, default_value_t = 0, conflicts_with_all = ["entropy_hex", "mnemonic"])]
     entropy_byte: u8,
@@ -60,47 +76,84 @@ struct DeriveArgs {
     #[arg(long)]
     mnemonic: Option<String>,
     /// Salt to derive with. Omit to show the canonical (lowest compliant) salt.
+    /// (f1 only.)
     #[arg(long)]
     salt: Option<u8>,
 }
 
+/// Pattern options shared by `search` and `gpu`.
 #[derive(clap::Args)]
-struct SearchArgs {
-    /// Match the start of the displayed address (base32: A-Z, 2-7).
+pub(crate) struct PatternArgs {
+    /// Match the start of the address (base32: A-Z, 2-7). A comma-separated
+    /// list matches any of them: --prefix ALGO,BEEF.
     #[arg(long)]
-    prefix: Option<String>,
-    /// Match the end of the displayed address (base32: A-Z, 2-7).
+    pub prefix: Option<String>,
+    /// Match the end of the address; comma-separated list = any of them. The
+    /// last char must be one of AEIMQUY4 (the final base32 char carries only
+    /// 3 data bits). With --prefix, every prefix × suffix combination counts.
     #[arg(long)]
-    suffix: Option<String>,
+    pub suffix: Option<String>,
+    /// Explicit prefix+suffix pairs, comma-separated: ABCD-WXYA,EF..QE
+    /// (`-` or `..` separates; either side may be empty: ALGO-, -XYZA).
+    #[arg(long, conflicts_with_all = ["prefix", "suffix"])]
+    pub pattern: Option<String>,
+    /// Multi-target search: keep searching targets that already have a hit
+    /// (default: each target is retired after its first hit).
+    #[arg(long, default_value_t = false)]
+    pub keep_found: bool,
+}
+
+impl PatternArgs {
+    pub fn targets(&self) -> anyhow::Result<targets::TargetSet> {
+        targets::TargetSet::parse(
+            self.prefix.as_deref(),
+            self.suffix.as_deref(),
+            self.pattern.as_deref(),
+            self.keep_found,
+        )
+    }
+}
+
+#[derive(clap::Args)]
+pub(crate) struct SearchArgs {
+    /// Account scheme.
+    #[arg(long, value_enum, default_value_t = Scheme::F1)]
+    pub scheme: Scheme,
+    #[command(flatten)]
+    pub pat: PatternArgs,
     /// Sweep salts 0..=MAX per key (only with --allow-non-canonical; the
     /// default canonical mode checks exactly the canonical salt).
     #[arg(long, default_value_t = 255)]
-    max_salt: u16,
+    pub max_salt: u16,
     /// Also accept matches at non-canonical compliant salts (higher hit rate,
     /// but the address is NOT what `algokey pq import -m` shows — signing as
-    /// it needs custom tooling). Default: canonical salt only.
+    /// it needs custom tooling). Default: canonical salt only. (f1 only.)
     #[arg(long, default_value_t = false)]
-    allow_non_canonical: bool,
+    pub allow_non_canonical: bool,
     /// Worker threads (default: cores - 1).
     #[arg(long, default_value_t = default_threads())]
-    threads: usize,
-    /// Stop after this many hits.
-    #[arg(long, default_value_t = 1)]
-    count: usize,
+    pub threads: usize,
+    /// Stop after this many hits. [default: 1, or one per target in a
+    /// multi-target search]
+    #[arg(long)]
+    pub count: Option<usize>,
     /// Directory for emitted hit record files (address, salt, mnemonic).
     #[arg(long, default_value = "./hits")]
-    out: PathBuf,
+    pub out: PathBuf,
     /// Extra entropy mixed into every generated seed (defense in depth): a
     /// file path if it names an existing file, otherwise the literal string.
     #[arg(long)]
-    extra_entropy: Option<String>,
+    pub extra_entropy: Option<String>,
     /// Suppress the per-second progress line.
     #[arg(long, default_value_t = false)]
-    quiet: bool,
+    pub quiet: bool,
 }
 
 #[derive(clap::Args)]
 struct BenchArgs {
+    /// Account scheme.
+    #[arg(long, value_enum, default_value_t = Scheme::F1)]
+    scheme: Scheme,
     /// Duration in seconds.
     #[arg(long, default_value_t = 5)]
     seconds: u64,
@@ -109,20 +162,23 @@ struct BenchArgs {
     threads: usize,
 }
 
-fn default_threads() -> usize {
+pub(crate) fn default_threads() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(1).max(1))
         .unwrap_or(1)
 }
 
 #[derive(clap::Args)]
-struct GpuArgs {
-    /// Match the start of the displayed address (base32: A-Z, 2-7).
+pub(crate) struct GpuArgs {
+    /// Account scheme.
+    #[arg(long, value_enum, default_value_t = Scheme::F1)]
+    pub scheme: Scheme,
+    #[command(flatten)]
+    pub pat: PatternArgs,
+    /// Keys per GPU batch. [default: 2^22 for f1, 2^26 for ed25519 — a few
+    /// seconds per batch on an RTX 5070]
     #[arg(long)]
-    prefix: String,
-    /// Entropies per GPU batch (one thread each).
-    #[arg(long, default_value_t = 1 << 22)]
-    items: u64,
+    pub items: Option<u64>,
     /// Sweep salts 0..=MAX per key on the device. High is good with
     /// --allow-non-canonical: the per-key cost is dominated by sampling+NTT,
     /// while each extra salt is a near-free SHA-512/256, so sweeping all 256
@@ -131,39 +187,43 @@ struct GpuArgs {
     /// probability ~2^-32, higher salts only add filtered-out hits), or 255
     /// with --allow-non-canonical]
     #[arg(long)]
-    max_salt: Option<u32>,
+    pub max_salt: Option<u32>,
     /// Also accept matches at non-canonical compliant salts (more candidate
     /// addresses per key, but the address is NOT what `algokey pq import -m`
     /// shows — signing as it needs custom tooling). Default: canonical salt
     /// only, so every hit works with stock algokey.
     #[arg(long, default_value_t = false)]
-    allow_non_canonical: bool,
+    pub allow_non_canonical: bool,
     /// Max raw device hits collected per batch.
     #[arg(long, default_value_t = 4096)]
-    max_hits: usize,
-    /// Stop after this many usable (completed + off-curve) addresses.
-    #[arg(long, default_value_t = 1)]
-    count: usize,
+    pub max_hits: usize,
+    /// Stop after this many usable addresses. [default: 1, or one per target
+    /// in a multi-target search]
+    #[arg(long)]
+    pub count: Option<usize>,
     /// Directory for emitted hit record files (address, salt, mnemonic).
     #[arg(long, default_value = "./hits")]
-    out: PathBuf,
+    pub out: PathBuf,
     /// Extra entropy mixed into every batch base seed (defense in depth): a
     /// file path if it names an existing file, otherwise the literal string.
     #[arg(long)]
-    extra_entropy: Option<String>,
+    pub extra_entropy: Option<String>,
     /// Accept more than one verified hit from the same GPU batch. Same-batch
     /// keys share the 24-byte base entropy (only the 8 counter bytes differ),
     /// so by default at most one hit per batch is emitted and later ones are
     /// discarded — free with --count 1, negligible for prefixes of 5+ chars.
     #[arg(long, default_value_t = false)]
-    allow_sibling_hits: bool,
+    pub allow_sibling_hits: bool,
     /// Stop after this many GPU batches (0 = unlimited). Use for benchmarking.
     #[arg(long, default_value_t = 0)]
-    batches: u64,
+    pub batches: u64,
 }
 
 #[derive(clap::Args)]
 struct GpuSelftestArgs {
+    /// Account scheme whose device pipeline to validate.
+    #[arg(long, value_enum, default_value_t = Scheme::F1)]
+    scheme: Scheme,
     /// Number of random entropies to validate.
     #[arg(long, default_value_t = 4096)]
     items: usize,
@@ -180,6 +240,9 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn cmd_gpu_selftest(a: GpuSelftestArgs) -> anyhow::Result<()> {
+    if a.scheme == Scheme::Ed25519 {
+        return classic::cmd_gpu_selftest(a.items);
+    }
     #[cfg(not(feature = "cuda"))]
     {
         let _ = a;
@@ -333,9 +396,135 @@ fn cmd_gpu_selftest(a: GpuSelftestArgs) -> anyhow::Result<()> {
                 anyhow::bail!("FAIL: retry — {mism}/{nr} accept-attempt mismatches");
             }
         }
+        // Stage 5: the device target matcher (prefix/suffix bit masks + the
+        // lazily computed display checksum) on crafted addresses.
+        selftest_matcher(false)?;
+
+        // Stage 6: the search kernel end to end — multi-target matching over
+        // a salt sweep, counter layout across the 2^64 wrap, hit collection.
+        {
+            let items = 2048u64;
+            let max_salt = 3u32;
+            let targets = targets::TargetSet::parse(None, None, Some("K-,-E,AB-Q"), true)?;
+            let mut base = [0u8; ENTROPY_SIZE];
+            getrandom::getrandom(&mut base).map_err(|e| anyhow::anyhow!("getrandom: {e}"))?;
+            let c0 = u64::MAX - items / 2;
+            let res = pq_cuda::search_batch(
+                &base,
+                c0,
+                items,
+                max_salt,
+                &targets.device_table(),
+                items as usize,
+            )?;
+            let mut dev: Vec<([u8; ENTROPY_SIZE], u8)> =
+                res.hits.iter().map(|h| (h.entropy, h.salt)).collect();
+            // CPU: first matching salt per key (keys with singular f skipped).
+            let mut cpu: Vec<([u8; ENTROPY_SIZE], u8)> = Vec::new();
+            let idx: Vec<u64> = (0..items).collect();
+            let workers = default_threads().max(1);
+            let parts: Vec<Vec<([u8; ENTROPY_SIZE], u8)>> = std::thread::scope(|sc| {
+                let hs: Vec<_> = idx
+                    .chunks(items.div_ceil(workers as u64) as usize)
+                    .map(|ch| {
+                        let targets = &targets;
+                        sc.spawn(move || {
+                            let mut v = Vec::new();
+                            for &i in ch {
+                                let mut e = base;
+                                e[24..32].copy_from_slice(&c0.wrapping_add(i).to_le_bytes());
+                                let fg = pq_core::sample_fg(&keygen_seed_from_entropy(&e));
+                                let Some(pk) = pq_core::pubkey_from_fg(&fg) else { continue };
+                                for salt in 0..=max_salt as u8 {
+                                    let d = pq_address(salt, pk.as_ref()).to_address_string();
+                                    if targets.first_match_display(&d).is_some() {
+                                        v.push((e, salt));
+                                        break;
+                                    }
+                                }
+                            }
+                            v
+                        })
+                    })
+                    .collect();
+                hs.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            for p in parts {
+                cpu.extend(p);
+            }
+            dev.sort();
+            cpu.sort();
+            if dev == cpu {
+                println!(
+                    "PASS: search — {} hits for {} over {items} keys × {} salts (across the 2^64 counter wrap) == CPU scan",
+                    dev.len(),
+                    targets.describe(),
+                    max_salt + 1
+                );
+            } else {
+                anyhow::bail!(
+                    "FAIL: search — device returned {} hits, CPU expects {}",
+                    dev.len(),
+                    cpu.len()
+                );
+            }
+        }
         println!("ALL STAGES PASS: device public pipeline is bit-exact with the CPU oracle.");
         Ok(())
     }
+}
+
+/// Self-test stage: a kernel's device target matcher (`ed` selects the
+/// ed25519 TU's copy) vs. display-string matching, on random addresses and
+/// patterns cut from them (with mutations), incl. a 1-char-heavy table.
+#[cfg(feature = "cuda")]
+pub(crate) fn selftest_matcher(ed: bool) -> anyhow::Result<()> {
+    let mut addrs = vec![[0u8; 32]; 60_000];
+    for a in addrs.iter_mut() {
+        getrandom::getrandom(a).map_err(|e| anyhow::anyhow!("getrandom: {e}"))?;
+    }
+    let displays: Vec<String> =
+        addrs.iter().map(|a| pq_core::Address(*a).to_address_string()).collect();
+    let mut rnd = [0u8; 4096];
+    getrandom::getrandom(&mut rnd).map_err(|e| anyhow::anyhow!("getrandom: {e}"))?;
+    // 200 patterns cut from the first addresses: prefix 0..=6, suffix 0..=4.
+    let mut pats = Vec::new();
+    for (k, d) in displays.iter().take(200).enumerate() {
+        let (p, s) = ((rnd[2 * k] % 7) as usize, (rnd[2 * k + 1] % 5) as usize);
+        let (p, s) = if p == 0 && s == 0 { (2, 0) } else { (p, s) };
+        let mut pre = d[..p].to_string();
+        // Mutate every 3rd prefix so near-misses are exercised too.
+        if k % 3 == 0 && p > 0 {
+            pre.replace_range(p - 1..p, if &d[p - 1..p] == "A" { "B" } else { "A" });
+        }
+        pats.push(format!("{pre}-{}", &d[58 - s..]));
+    }
+    let tables = [
+        pats.join(","),
+        // Short patterns: many positives, suffix-only targets hash every key.
+        "Q-,-E,AB-,-4,7-A".to_string(),
+    ];
+    for t in &tables {
+        let set = targets::TargetSet::parse(None, None, Some(t), true)?;
+        let dev = pq_cuda::dbg_match(&addrs, &set.device_table(), ed)?;
+        let mut pos = 0usize;
+        for (i, d) in displays.iter().enumerate() {
+            let want = set.first_match_display(d).is_some();
+            pos += want as usize;
+            anyhow::ensure!(
+                (dev[i] != 0) == want,
+                "FAIL: matcher — device says {} for {d} ({})",
+                dev[i],
+                set.describe()
+            );
+        }
+        println!(
+            "PASS: matcher — device == display-string match on {} addresses ({}; {pos} positives)",
+            addrs.len(),
+            set.describe()
+        );
+    }
+    Ok(())
 }
 
 /// A raw device hit that survived CPU verification and is ready to emit.
@@ -346,11 +535,17 @@ struct VerifiedHit {
     addr: pq_core::Address,
     kp: pq_core::Keypair,
     roundtrip: bool,
+    /// Index of the matched target in the TargetSet.
+    target: usize,
 }
 
 /// Re-derive, complete, and check one raw device hit on the CPU.
 #[cfg(feature = "cuda")]
-fn verify_one(hit: &pq_cuda::Hit, prefix: &str, canonical_only: bool) -> Option<VerifiedHit> {
+fn verify_one(
+    hit: &pq_cuda::Hit,
+    targets: &targets::TargetSet,
+    canonical_only: bool,
+) -> Option<VerifiedHit> {
     // Single-attempt predicate, matching the kernel's first-sample scan: the
     // hit is usable iff the reference keygen accepts the FIRST (f,g) — then
     // `algokey pq import -m` derives this exact key. (Full keygen_from_seed
@@ -360,8 +555,10 @@ fn verify_one(hit: &pq_cuda::Hit, prefix: &str, canonical_only: bool) -> Option<
     let fg = pq_core::sample_fg(&seed);
     let kp = pq_core::complete_from_fg(&fg)?;
     let addr = pq_core::pq_address(hit.salt, kp.public_key.as_ref());
-    // Must actually match the requested pattern AND be off-curve.
-    if !addr.to_address_string().starts_with(prefix) || !addr.is_pq_compliant() {
+    // Must actually match an active target (full display string — independent
+    // of the device bit-mask matcher) AND be off-curve.
+    let target = targets.first_match_display(&addr.to_address_string())?;
+    if !addr.is_pq_compliant() {
         return None;
     }
     // Canonical-only: the matched salt must be the lowest compliant one, so
@@ -381,12 +578,17 @@ fn verify_one(hit: &pq_cuda::Hit, prefix: &str, canonical_only: bool) -> Option<
         addr,
         kp,
         roundtrip,
+        target,
     })
 }
 
 /// Verify a batch of raw hits across all cores, preserving order (None = culled).
 #[cfg(feature = "cuda")]
-fn verify_hits(hits: &[pq_cuda::Hit], prefix: &str, canonical_only: bool) -> Vec<Option<VerifiedHit>> {
+fn verify_hits(
+    hits: &[pq_cuda::Hit],
+    targets: &targets::TargetSet,
+    canonical_only: bool,
+) -> Vec<Option<VerifiedHit>> {
     let n = hits.len();
     let mut out: Vec<Option<VerifiedHit>> = Vec::new();
     out.resize_with(n, || None);
@@ -399,7 +601,7 @@ fn verify_hits(hits: &[pq_cuda::Hit], prefix: &str, canonical_only: bool) -> Vec
         for (hchunk, ochunk) in hits.chunks(chunk).zip(out.chunks_mut(chunk)) {
             s.spawn(move || {
                 for (h, slot) in hchunk.iter().zip(ochunk.iter_mut()) {
-                    *slot = verify_one(h, prefix, canonical_only);
+                    *slot = verify_one(h, targets, canonical_only);
                 }
             });
         }
@@ -408,17 +610,18 @@ fn verify_hits(hits: &[pq_cuda::Hit], prefix: &str, canonical_only: bool) -> Vec
 }
 
 fn cmd_gpu(a: GpuArgs) -> anyhow::Result<()> {
-    // Validate/uppercase the pattern and map to 5-bit base32 indices (what the
-    // kernel's base32_prefix_match compares against).
-    let prefix = search::validate_pattern(&a.prefix)?;
-    let indices: Vec<u8> = prefix
-        .bytes()
-        .map(|c| search::BASE32_ALPHABET.find(c as char).unwrap() as u8)
-        .collect();
+    let targets = a.pat.targets()?;
+    targets.check_gpu()?;
+    let count = a.count.unwrap_or_else(|| targets.default_count());
+    anyhow::ensure!(count >= 1, "--count must be >= 1");
+    if a.scheme == Scheme::Ed25519 {
+        return classic::cmd_gpu(a, targets, count);
+    }
+    let items = a.items.unwrap_or(1 << 22);
 
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (a, indices);
+        let _ = (a, items);
         anyhow::bail!(
             "GPU support is not compiled in. Build on a CUDA box with:\n  \
              cargo build -p pq-vanity --release --features cuda"
@@ -443,10 +646,15 @@ fn cmd_gpu(a: GpuArgs) -> anyhow::Result<()> {
         // loses nothing and skips device hits the host would only filter out.
         let max_salt = a.max_salt.unwrap_or(if canonical_only { 31 } else { 255 });
         eprintln!(
-            "GPU search: prefix={prefix:?} items/batch={} max_salt={max_salt} canonical_only={canonical_only} count={} (device: {} GPU)",
-            a.items,
-            a.count,
+            "GPU search: {} items/batch={} max_salt={max_salt} canonical_only={canonical_only} count={count} (device: {} GPU)",
+            targets.describe(),
+            items,
             pq_cuda::device_count()
+        );
+        eprintln!(
+            "~{:.3e} usable keys per hit (expectation, any target{})",
+            1.0 / targets.hit_rate(),
+            if canonical_only { "" } else { "; ×2 for off-curve per address" }
         );
 
         let mix = entropy::EntropyMix::new(load_extra_entropy(&a.extra_entropy)?.as_deref());
@@ -470,31 +678,38 @@ fn cmd_gpu(a: GpuArgs) -> anyhow::Result<()> {
             // zero-suffix fingerprint. Siblings are still counter-adjacent —
             // independence comes from one-hit-per-batch, not from this.
             let start_counter = u64::from_le_bytes(base_entropy[24..32].try_into().unwrap());
+            // Only still-active targets go to the device (multi-target mode
+            // retires each target after its first hit).
+            let table = targets.device_table();
             let res = pq_cuda::search_batch(
                 &base_entropy,
                 start_counter,
-                a.items,
+                items,
                 max_salt,
-                &indices,
+                &table,
                 a.max_hits,
             )?;
             raw_hits += res.hits.len() as u64;
-            keys_done += a.items as u128;
+            keys_done += items as u128;
 
             // Verify raw hits on all cores: completing a key (NTRU solve) costs
             // ~2ms, and short prefixes can return thousands of raw hits per
             // batch — serial verification would throttle the (fast) kernel.
             let mut batch_emitted = 0usize;
-            for v in verify_hits(&res.hits, &prefix, canonical_only)
+            for v in verify_hits(&res.hits, &targets, canonical_only)
                 .into_iter()
                 .flatten()
             {
+                if !targets.is_active(v.target) {
+                    continue; // target already found earlier in this batch
+                }
                 // Same-batch keys share the 24-byte base entropy; emit at most
                 // one per batch so every reported key is independent.
                 if !a.allow_sibling_hits && batch_emitted >= 1 {
                     siblings_discarded += 1;
                     continue;
                 }
+                targets.claim(v.target);
                 let path = search::write_hit_record(
                     &a.out,
                     &v.entropy,
@@ -513,8 +728,9 @@ fn cmd_gpu(a: GpuArgs) -> anyhow::Result<()> {
                     &v.kp,
                     v.roundtrip,
                     path.as_deref(),
+                    &targets.list[v.target].label(),
                 );
-                if found >= a.count {
+                if found >= count || !targets.any_active() {
                     break;
                 }
             }
@@ -526,7 +742,7 @@ fn cmd_gpu(a: GpuArgs) -> anyhow::Result<()> {
                 keys_done as f64 / elapsed / 1e6,
                 addrs as f64 / elapsed / 1e6
             );
-            if found >= a.count {
+            if found >= count || !targets.any_active() {
                 break;
             }
             if a.batches != 0 && batch + 1 >= a.batches {
@@ -550,7 +766,7 @@ fn cmd_gpu(a: GpuArgs) -> anyhow::Result<()> {
 
 /// Resolve `--extra-entropy`: a path if it names an existing file, otherwise
 /// the literal string bytes.
-fn load_extra_entropy(arg: &Option<String>) -> anyhow::Result<Option<Vec<u8>>> {
+pub(crate) fn load_extra_entropy(arg: &Option<String>) -> anyhow::Result<Option<Vec<u8>>> {
     let Some(v) = arg else { return Ok(None) };
     let p = std::path::Path::new(v);
     let bytes = if p.is_file() {
@@ -572,6 +788,10 @@ fn parse_hex(s: &str) -> anyhow::Result<Vec<u8>> {
 }
 
 fn cmd_derive(a: DeriveArgs) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        a.scheme == Scheme::F1 || a.salt.is_none(),
+        "--salt applies to f1 only (classic addresses have no salt)"
+    );
     let mut entropy = [0u8; ENTROPY_SIZE];
     if let Some(m) = &a.mnemonic {
         entropy = pq_core::mnemonic_to_key(m).map_err(|e| anyhow::anyhow!("bad mnemonic: {e}"))?;
@@ -585,6 +805,10 @@ fn cmd_derive(a: DeriveArgs) -> anyhow::Result<()> {
         entropy.copy_from_slice(&bytes);
     } else {
         entropy[0] = a.entropy_byte;
+    }
+    if a.scheme == Scheme::Ed25519 {
+        classic::derive(&entropy);
+        return Ok(());
     }
     let seed = keygen_seed_from_entropy(&entropy);
     let kp = keygen_from_seed(&seed)?;
@@ -613,42 +837,28 @@ fn cmd_derive(a: DeriveArgs) -> anyhow::Result<()> {
 }
 
 fn cmd_search(a: SearchArgs) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        a.prefix.is_some() || a.suffix.is_some(),
-        "specify at least one of --prefix / --suffix"
-    );
     anyhow::ensure!(a.threads >= 1, "--threads must be >= 1");
-    anyhow::ensure!(a.count >= 1, "--count must be >= 1");
+    let targets = Arc::new(a.pat.targets()?);
+    let count = a.count.unwrap_or_else(|| targets.default_count());
+    anyhow::ensure!(count >= 1, "--count must be >= 1");
 
-    let prefix = a
-        .prefix
-        .as_deref()
-        .map(search::validate_pattern)
-        .transpose()?;
-    let suffix = a
-        .suffix
-        .as_deref()
-        .map(search::validate_pattern)
-        .transpose()?;
-
+    if a.scheme == Scheme::Ed25519 {
+        return classic::cmd_search(a, targets, count);
+    }
     let canonical_only = !a.allow_non_canonical;
-    let pat_len = prefix.as_ref().map_or(0, |p| p.len()) + suffix.as_ref().map_or(0, |s| s.len());
     eprintln!(
-        "searching: prefix={:?} suffix={:?} threads={} count={} canonical_only={canonical_only}",
-        prefix, suffix, a.threads, a.count
+        "searching: {} threads={} count={count} canonical_only={canonical_only}",
+        targets.describe(),
+        a.threads
     );
     if canonical_only {
         // One canonical (always-compliant) address per key.
-        eprintln!(
-            "pattern length {pat_len} → ~{:.3e} keys per hit (expectation)",
-            32f64.powi(pat_len as i32)
-        );
+        eprintln!("~{:.3e} keys per hit (expectation, any target)", 1.0 / targets.hit_rate());
     } else {
-        // Each tested address matches with probability ~32^-pat_len; we
-        // additionally require off-curve compliance (~1/2).
+        // Each tested address must also be off-curve compliant (~1/2).
         eprintln!(
-            "pattern length {pat_len} → ~{:.3e} addresses per hit (expectation)",
-            2.0f64 * 32f64.powi(pat_len as i32)
+            "~{:.3e} addresses per hit (expectation, any target)",
+            2.0 / targets.hit_rate()
         );
     }
 
@@ -659,12 +869,11 @@ fn cmd_search(a: SearchArgs) -> anyhow::Result<()> {
 
     let cfg = search::SearchConfig {
         mix,
-        prefix,
-        suffix,
+        targets,
         max_salt: a.max_salt,
         canonical_only,
         threads: a.threads,
-        count: a.count,
+        count,
         out_dir: a.out,
         progress: !a.quiet,
     };
@@ -674,6 +883,9 @@ fn cmd_search(a: SearchArgs) -> anyhow::Result<()> {
 }
 
 fn cmd_bench(a: BenchArgs) -> anyhow::Result<()> {
+    if a.scheme == Scheme::Ed25519 {
+        return classic::cmd_bench(a.seconds, a.threads);
+    }
     eprintln!(
         "benchmarking keygen + 256-salt derivation for {}s on {} threads...",
         a.seconds, a.threads

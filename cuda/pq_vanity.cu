@@ -10,7 +10,8 @@
 //   modq_encode(h) -> pk[1793]
 //   for salt in 0..=max_salt:
 //       addr32 = SHA512_256("PQA" || "f1" || salt || pk)
-//       compare base32(addr32) leading chars to target prefix
+//       match addr32 against the target table (prefix bits; suffix bits
+//       incl. the display checksum, hashed only when needed)
 //   on match: append (entropy, salt) to the device hit buffer (atomic)
 //
 // The CPU host (pq-core) re-derives (f,g) from a hit's entropy, runs solve_NTRU
@@ -89,27 +90,6 @@ __device__ __forceinline__ void derive_entropy(
 // entropy -> Falcon keygen seed: SHA512_256("PQK" || "f1" || entropy).
 // Defined after the SHA-512/256 section below.
 __device__ void dev_seed_from_entropy(const uint8_t* entropy, uint8_t* seed);
-
-// Compare the base32 of addr32's leading bytes to `prefix` (prefix_len chars,
-// each already an index 0..31 OR an ASCII base32 char — see host). Returns 1 on
-// match. Valid for prefixes up to 51 chars (first 32 bytes -> 51.2 base32 chars).
-__device__ int base32_prefix_match(
-    const uint8_t* addr32, const uint8_t* prefix, int prefix_len)
-{
-    // 5 bits per output char, big-endian bit order (RFC-4648).
-    int bitpos = 0;
-    for (int i = 0; i < prefix_len; ++i) {
-        int byte_index = bitpos >> 3;
-        int bit_index = bitpos & 7;
-        // Gather 5 bits starting at (byte_index, bit_index), MSB-first.
-        uint32_t window = ((uint32_t)addr32[byte_index] << 8) |
-                          (uint32_t)(byte_index + 1 < PQ_ADDR_SIZE ? addr32[byte_index + 1] : 0);
-        uint32_t v = (window >> (11 - bit_index)) & 0x1F;
-        if ((uint8_t)v != prefix[i]) return 0;
-        bitpos += 5;
-    }
-    return 1;
-}
 
 // ===========================================================================
 // Device SHAKE256 (Keccak-f[1600], rate 136) — ported from vendor/falcon/shake.c,
@@ -801,6 +781,94 @@ cleanup:
 }
 
 // ===========================================================================
+// Search targets (see crates/pq-vanity/src/targets.rs): with hi = BE u64 of
+// addr32[0..8] and lo = BE u64 of addr32[28..32] || checksum4, a target
+// matches iff (hi & pmask) == pval && (lo & smask) == sval. Uniform loop over
+// __constant__ memory → every lane reads the same entry (broadcast).
+// ===========================================================================
+
+#define PQ_MAX_TARGETS 1024
+struct PqTarget { uint64_t pmask, pval, smask, sval; };
+__device__ __constant__ PqTarget PQ_TARGETS[PQ_MAX_TARGETS];
+
+__device__ __forceinline__ uint64_t pq_be64(const uint8_t* p) {
+    uint64_t v = 0;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) v = (v << 8) | p[i];
+    return v;
+}
+
+// 1 if any of the n_targets matches addr32. The display checksum
+// (SHA512_256(addr32)[28..32]) is computed lazily — only for a suffix target
+// whose prefix already matched — so prefix-only searches never hash.
+__device__ int pq_match_targets(const uint8_t* addr32, int n_targets)
+{
+    const uint64_t hi = pq_be64(addr32);
+    uint64_t lo = 0;
+    int have_lo = 0;
+    for (int t = 0; t < n_targets; ++t) {
+        const PqTarget T = PQ_TARGETS[t];
+        if ((hi & T.pmask) != T.pval) continue;
+        if (T.smask == 0) return 1;
+        if (!have_lo) {
+            Sha512 s;
+            sha512_256_init(s);
+            sha512_update(s, addr32, PQ_ADDR_SIZE);
+            uint8_t sum[32];
+            sha512_256_final(s, sum);
+            lo = ((uint64_t)(uint32_t)pq_be64(addr32 + 24) << 32) |
+                 (uint64_t)(uint32_t)pq_be64(sum + 24);
+            have_lo = 1;
+        }
+        if ((lo & T.smask) == T.sval) return 1;
+    }
+    return 0;
+}
+
+static int pq_upload_targets(const uint64_t* targets, int n_targets)
+{
+    if (n_targets < 0 || n_targets > PQ_MAX_TARGETS) return -1000;
+    if (n_targets == 0) return 0;
+    cudaError_t e = cudaMemcpyToSymbol(PQ_TARGETS, targets, (size_t)n_targets * sizeof(PqTarget));
+    return e == cudaSuccess ? 0 : -(int)e;
+}
+
+// Debug: out[n] = pq_match_targets(addrs[i]) for n raw 32-byte addresses.
+extern "C" __global__ void pq_dbg_match_kernel(
+    const uint8_t* __restrict__ addrs, uint64_t n, int n_targets, uint8_t* __restrict__ out)
+{
+    uint64_t gid = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
+    if (gid >= n) return;
+    out[gid] = (uint8_t)pq_match_targets(addrs + gid * PQ_ADDR_SIZE, n_targets);
+}
+
+extern "C" int pq_cuda_dbg_match(const uint8_t* addrs, uint64_t n,
+                                 const uint64_t* targets, int n_targets, uint8_t* out)
+{
+    uint8_t* d_addrs = nullptr;
+    uint8_t* d_out = nullptr;
+    int rc = pq_upload_targets(targets, n_targets);
+    if (rc != 0) return rc;
+    #define CKM(call) do { cudaError_t e = (call); if (e != cudaSuccess) { rc = -(int)e; goto cleanup; } } while (0)
+    CKM(cudaMalloc(&d_addrs, n * PQ_ADDR_SIZE));
+    CKM(cudaMalloc(&d_out, n));
+    CKM(cudaMemcpy(d_addrs, addrs, n * PQ_ADDR_SIZE, cudaMemcpyHostToDevice));
+    {
+        unsigned long long blocks = (n + 127) / 128;
+        if (blocks == 0) blocks = 1;
+        pq_dbg_match_kernel<<<(unsigned int)blocks, 128>>>(d_addrs, n, n_targets, d_out);
+        CKM(cudaGetLastError());
+        CKM(cudaDeviceSynchronize());
+    }
+    CKM(cudaMemcpy(out, d_out, n, cudaMemcpyDeviceToHost));
+cleanup:
+    if (d_addrs) cudaFree(d_addrs);
+    if (d_out) cudaFree(d_out);
+    #undef CKM
+    return rc;
+}
+
+// ===========================================================================
 // Kernel + host harness (complete; exercises the full launch/copy pipeline).
 // ===========================================================================
 
@@ -843,8 +911,7 @@ extern "C" __global__ void pq_search_kernel(
     uint64_t start_counter,
     uint64_t num_items,
     uint32_t max_salt,
-    const uint8_t* __restrict__ prefix,
-    int prefix_len,
+    int n_targets,
     uint8_t* __restrict__ out_hits,
     int max_hits,
     unsigned int* __restrict__ hit_count)
@@ -870,7 +937,7 @@ extern "C" __global__ void pq_search_kernel(
     uint8_t addr32[PQ_ADDR_SIZE];
     for (uint32_t salt = 0; salt <= max_salt; ++salt) {
         dev_pq_addr32(pk, (uint8_t)salt, addr32);
-        if (base32_prefix_match(addr32, prefix, prefix_len)) {
+        if (pq_match_targets(addr32, n_targets)) {
             unsigned int slot = atomicAdd(hit_count, 1u);
             if ((int)slot < max_hits) {
                 uint8_t* dst = out_hits + (size_t)slot * PQ_HIT_STRIDE;
@@ -967,8 +1034,8 @@ extern "C" int pq_cuda_search(
     uint64_t start_counter,
     uint64_t num_items,
     uint32_t max_salt,
-    const uint8_t* prefix,
-    int prefix_len,
+    const uint64_t* targets,   // n_targets × {pmask, pval, smask, sval}
+    int n_targets,
     uint8_t* out_hits,
     int max_hits,
     int* out_stub)
@@ -979,10 +1046,11 @@ extern "C" int pq_cuda_search(
     {
         int ir = pq_cuda_init_tables();
         if (ir != 0) return ir;
+        ir = pq_upload_targets(targets, n_targets);
+        if (ir != 0) return ir;
     }
 
     uint8_t* d_seed = nullptr;
-    uint8_t* d_prefix = nullptr;
     uint8_t* d_hits = nullptr;
     unsigned int* d_count = nullptr;
     unsigned int count = 0;   // declared before any `goto cleanup` (no init-crossing)
@@ -991,12 +1059,9 @@ extern "C" int pq_cuda_search(
     #define CK(call) do { cudaError_t e = (call); if (e != cudaSuccess) { rc = -(int)e; goto cleanup; } } while (0)
 
     CK(cudaMalloc(&d_seed, PQ_ENTROPY_SIZE));
-    CK(cudaMalloc(&d_prefix, prefix_len > 0 ? (size_t)prefix_len : 1));
     CK(cudaMalloc(&d_hits, (size_t)max_hits * PQ_HIT_STRIDE));
     CK(cudaMalloc(&d_count, sizeof(unsigned int)));
     CK(cudaMemcpy(d_seed, base_entropy, PQ_ENTROPY_SIZE, cudaMemcpyHostToDevice));
-    if (prefix_len > 0)
-        CK(cudaMemcpy(d_prefix, prefix, prefix_len, cudaMemcpyHostToDevice));
     CK(cudaMemset(d_count, 0, sizeof(unsigned int)));
 
     {
@@ -1010,7 +1075,7 @@ extern "C" int pq_cuda_search(
         if (blocks == 0) blocks = 1;
         pq_search_kernel<<<(unsigned int)blocks, block>>>(
             d_seed, start_counter, num_items, max_salt,
-            d_prefix, prefix_len, d_hits, max_hits, d_count);
+            n_targets, d_hits, max_hits, d_count);
         CK(cudaGetLastError());
         CK(cudaDeviceSynchronize());
     }
@@ -1023,7 +1088,6 @@ extern "C" int pq_cuda_search(
 
 cleanup:
     if (d_seed)   cudaFree(d_seed);
-    if (d_prefix) cudaFree(d_prefix);
     if (d_hits)   cudaFree(d_hits);
     if (d_count)  cudaFree(d_count);
     #undef CK

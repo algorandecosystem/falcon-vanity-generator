@@ -57,6 +57,10 @@ test: ## Run the test suite (KATs, formats, fast-path shim)
 selftest: ## Validate the CUDA device pipeline vs the CPU oracle (needs build-cuda)
 	./target/release/pq-vanity gpu-selftest --items $(ITEMS)
 
+.PHONY: selftest-ed25519
+selftest-ed25519: ## Validate the classic (Ed25519) CUDA pipeline vs the CPU oracle
+	./target/release/pq-vanity gpu-selftest --scheme ed25519 --items $(ITEMS)
+
 .PHONY: derive
 derive: ## Sanity check: derive the KAT address for entropy byte 0
 	$(CARGO) run --release -q -- derive --entropy-byte 0

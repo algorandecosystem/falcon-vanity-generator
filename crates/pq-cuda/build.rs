@@ -26,6 +26,8 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(cuda_built)");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=../../cuda/pq_vanity.cu");
+    println!("cargo:rerun-if-changed=../../cuda/ed25519_vanity.cu");
+    println!("cargo:rerun-if-changed=../../vendor/ed25519-cuda");
     println!("cargo:rerun-if-env-changed=PQ_CUDA_ARCHS");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
 
@@ -43,8 +45,17 @@ fn main() {
     };
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let kernel = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cuda/pq_vanity.cu");
-    let obj = out_dir.join("pq_vanity.o");
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    // (source, object, extra nvcc args). ed25519_vanity.cu #includes the
+    // vendored solana-perf-libs ed25519 CUDA sources (unmodified).
+    let units = [
+        (root.join("cuda/pq_vanity.cu"), out_dir.join("pq_vanity.o"), vec![]),
+        (
+            root.join("cuda/ed25519_vanity.cu"),
+            out_dir.join("ed25519_vanity.o"),
+            vec!["-I".to_string(), root.join("vendor/ed25519-cuda").display().to_string()],
+        ),
+    ];
     let lib = out_dir.join("libpq_vanity_cuda.a");
 
     let archs = env::var("PQ_CUDA_ARCHS").unwrap_or_else(|_| "120,121".to_string());
@@ -82,15 +93,30 @@ fn main() {
         );
     }
 
-    cmd.arg("-c").arg(&kernel).arg("-o").arg(&obj);
-    run(cmd, "nvcc compile");
+    // Compile the units concurrently (each nvcc is single-threaded; the
+    // ed25519 unit alone takes ~20s per arch).
+    let handles: Vec<_> = units
+        .iter()
+        .map(|(src, obj, extra)| {
+            let mut c = Command::new(cmd.get_program());
+            c.args(cmd.get_args()).args(extra).arg("-c").arg(src).arg("-o").arg(obj);
+            let what = format!("nvcc compile {}", src.file_name().unwrap().to_string_lossy());
+            std::thread::spawn(move || run(c, &what))
+        })
+        .collect();
+    for h in handles {
+        h.join().expect("nvcc compile thread panicked");
+    }
 
-    // Archive the object into a static lib for the Rust linker.
+    // Archive the objects into a static lib for the Rust linker.
     let _ = std::fs::remove_file(&lib);
     run(
         {
             let mut ar = Command::new("ar");
-            ar.arg("crs").arg(&lib).arg(&obj);
+            ar.arg("crs").arg(&lib);
+            for (_, obj, _) in &units {
+                ar.arg(obj);
+            }
             ar
         },
         "ar archive",

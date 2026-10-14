@@ -26,10 +26,9 @@ pub struct SearchConfig {
     /// Multi-source entropy mixer (see `entropy.rs`); cached TPM/jitter
     /// contributions are refreshed only after an emitted hit.
     pub mix: Arc<crate::entropy::EntropyMix>,
-    /// Uppercased, validated prefix to match against the displayed address.
-    pub prefix: Option<String>,
-    /// Uppercased, validated suffix.
-    pub suffix: Option<String>,
+    /// Patterns to match (prefix / suffix / pairs; retired as found in
+    /// multi-target mode).
+    pub targets: Arc<crate::targets::TargetSet>,
     /// Sweep salts `0..=max_salt` per key (ignored when `canonical_only`).
     pub max_salt: u16,
     /// Require the match to be the *canonical* (lowest compliant) salt, so the
@@ -41,34 +40,6 @@ pub struct SearchConfig {
     pub out_dir: PathBuf,
     /// Print a throughput line roughly every second.
     pub progress: bool,
-}
-
-/// Validate that `pat` uses only the base32 alphabet; returns the uppercased form.
-pub fn validate_pattern(pat: &str) -> anyhow::Result<String> {
-    let up = pat.to_ascii_uppercase();
-    for c in up.chars() {
-        if !BASE32_ALPHABET.contains(c) {
-            anyhow::bail!(
-                "pattern character {c:?} is not in the Algorand base32 alphabet ({BASE32_ALPHABET})"
-            );
-        }
-    }
-    Ok(up)
-}
-
-#[inline]
-fn matches(display: &str, cfg: &SearchConfig) -> bool {
-    if let Some(p) = &cfg.prefix {
-        if !display.starts_with(p.as_str()) {
-            return false;
-        }
-    }
-    if let Some(s) = &cfg.suffix {
-        if !display.ends_with(s.as_str()) {
-            return false;
-        }
-    }
-    true
 }
 
 struct Counters {
@@ -142,11 +113,12 @@ fn worker(cfg: &SearchConfig, counters: &Counters, io_lock: &Mutex<()>) {
             Err(_) => continue, // extremely rare keygen failure; try another entropy
         };
 
+        // Matching skips the display checksum unless a suffix needs it.
         if cfg.canonical_only {
             if let Some((salt, addr)) = canonical_pq_salt(kp.public_key.as_ref()) {
                 counters.addrs.fetch_add(1, Ordering::Relaxed);
-                if matches(&addr.to_address_string(), cfg) {
-                    record_hit(cfg, counters, io_lock, &entropy, salt, &addr, &kp);
+                if let Some(t) = cfg.targets.first_match(&addr) {
+                    record_hit(cfg, counters, io_lock, &entropy, salt, &addr, &kp, t);
                 }
             }
         } else {
@@ -154,11 +126,13 @@ fn worker(cfg: &SearchConfig, counters: &Counters, io_lock: &Mutex<()>) {
                 let salt = salt as u8;
                 let addr = pq_address(salt, kp.public_key.as_ref());
                 counters.addrs.fetch_add(1, Ordering::Relaxed);
-                // Cheap string match first; compliance (curve decompress) only on a
+                // Cheap match first; compliance (curve decompress) only on a
                 // candidate. A usable address must be off-curve compliant.
-                if matches(&addr.to_address_string(), cfg) && addr.is_pq_compliant() {
-                    record_hit(cfg, counters, io_lock, &entropy, salt, &addr, &kp);
-                    break; // one usable salt per key is enough
+                if let Some(t) = cfg.targets.first_match(&addr) {
+                    if addr.is_pq_compliant() {
+                        record_hit(cfg, counters, io_lock, &entropy, salt, &addr, &kp, t);
+                        break; // one usable salt per key is enough
+                    }
                 }
             }
         }
@@ -166,6 +140,7 @@ fn worker(cfg: &SearchConfig, counters: &Counters, io_lock: &Mutex<()>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_hit(
     cfg: &SearchConfig,
     counters: &Counters,
@@ -174,7 +149,12 @@ fn record_hit(
     salt: u8,
     addr: &Address,
     kp: &Keypair,
+    target: usize,
 ) {
+    // Multi-target: the first hit retires its target (lost races drop out).
+    if !cfg.targets.claim(target) {
+        return;
+    }
     let n = counters.hits.fetch_add(1, Ordering::SeqCst);
     if n >= cfg.count as u64 {
         // Already have enough; undo the over-count and stop.
@@ -191,8 +171,9 @@ fn record_hit(
 
     let _guard = io_lock.lock().unwrap();
     let path = write_hit_record(&cfg.out_dir, entropy, salt, addr, kp, cfg.mix.sources());
-    print_hit(n + 1, entropy, salt, addr, kp, roundtrip, path.as_deref());
-    if n + 1 >= cfg.count as u64 {
+    let label = cfg.targets.list[target].label();
+    print_hit(n + 1, entropy, salt, addr, kp, roundtrip, path.as_deref(), &label);
+    if n + 1 >= cfg.count as u64 || !cfg.targets.any_active() {
         counters.stop.store(true, Ordering::Relaxed);
     } else {
         // Re-request the cached contributions (TPM + jitter) so the next hit
@@ -246,6 +227,7 @@ pub fn write_hit_record(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn print_hit(
     hit_no: u64,
     entropy: &[u8; ENTROPY_SIZE],
@@ -254,11 +236,13 @@ pub fn print_hit(
     kp: &Keypair,
     roundtrip: bool,
     path: Option<&std::path::Path>,
+    matched: &str,
 ) {
     let display = addr.to_address_string();
     let canonical = canonical_pq_salt(kp.public_key.as_ref());
     println!("─────────────────────────────────────────────");
     println!("HIT #{hit_no}  address: {display}");
+    println!("  matched:   {matched}");
     println!("  scheme:    f1 (Falcon-1024)");
     match canonical {
         Some((cs, ca)) if cs == salt => {

@@ -6,8 +6,9 @@
 //!
 //! The device kernel computes, per thread, the Falcon-1024 **public half**
 //! (`h = g·f⁻¹ mod 12289`) from mnemonic entropy (PQK seed hash on-device), encodes `pk`, hashes the PQ preimage
-//! with SHA-512/256 over a salt range, and compares the base32 of `addr32`
-//! against the target prefix — all integer-only (no FP64). Hits return the
+//! with SHA-512/256 over a salt range, and matches `addr32` against a table of
+//! prefix/suffix targets (the display checksum is hashed only when a suffix
+//! target's prefix matched) — all integer-only (no FP64). Hits return the
 //! `(entropy, salt)`; the host re-derives and completes the key on the CPU
 //! (`pq-core`). See `cuda/KERNEL.md` for the kernel status and the bit-exact
 //! validation protocol against the CPU oracle.
@@ -93,11 +94,35 @@ mod ffi {
             start_counter: u64,
             num_items: u64,
             max_salt: u32,
-            prefix: *const u8,
-            prefix_len: c_int,
+            targets: *const u64, // [n_targets * 4]
+            n_targets: c_int,
             out_hits: *mut u8, // [max_hits * (ENTROPY_SIZE + 1)]
             max_hits: c_int,
             out_stub: *mut c_int,
+        ) -> c_int;
+        pub fn ed_cuda_dbg_pubkey(seeds: *const u8, n: u64, fast: c_int, out_pk: *mut u8) -> c_int;
+        pub fn pq_cuda_dbg_match(
+            addrs: *const u8,
+            n: u64,
+            targets: *const u64,
+            n_targets: c_int,
+            out: *mut u8,
+        ) -> c_int;
+        pub fn ed_cuda_dbg_match(
+            addrs: *const u8,
+            n: u64,
+            targets: *const u64,
+            n_targets: c_int,
+            out: *mut u8,
+        ) -> c_int;
+        pub fn ed_cuda_search(
+            base_seed: *const u8, // [32]
+            start_counter: u64,
+            num_items: u64,
+            targets: *const u64, // [n_targets * 4]
+            n_targets: c_int,
+            out_hits: *mut u8, // [max_hits * ED_SEED_SIZE]
+            max_hits: c_int,
         ) -> c_int;
     }
 }
@@ -249,15 +274,53 @@ pub fn device_count() -> i32 {
     }
 }
 
+/// Search target in device form: `[pmask, pval, smask, sval]` (see
+/// `pq-vanity/src/targets.rs`). At most [`MAX_TARGETS`] per batch.
+pub type DeviceTarget = [u64; 4];
+/// Device target-table capacity (both kernels).
+pub const MAX_TARGETS: usize = 1024;
+
+/// Debug/validation: run a kernel's device target matcher on raw 32-byte
+/// addresses (`ed = true` → the ed25519 TU's copy). Returns one 0/1 per address.
+pub fn dbg_match(addrs: &[[u8; 32]], targets: &[DeviceTarget], ed: bool) -> Result<Vec<u8>, CudaError> {
+    #[cfg(not(cuda_built))]
+    {
+        let _ = (addrs, targets, ed);
+        Err(CudaError::NotBuilt)
+    }
+    #[cfg(cuda_built)]
+    {
+        assert!(targets.len() <= MAX_TARGETS);
+        let n = addrs.len();
+        let flat: Vec<u8> = addrs.iter().flatten().copied().collect();
+        let mut out = vec![0u8; n];
+        let f = if ed { ffi::ed_cuda_dbg_match } else { ffi::pq_cuda_dbg_match };
+        // SAFETY: flat is n*32 bytes, targets n_targets*4 u64, out n bytes.
+        let rc = unsafe {
+            f(
+                flat.as_ptr(),
+                n as u64,
+                targets.as_ptr().cast(),
+                targets.len() as core::ffi::c_int,
+                out.as_mut_ptr(),
+            )
+        };
+        if rc < 0 {
+            return Err(CudaError::Runtime(rc));
+        }
+        Ok(out)
+    }
+}
+
 /// Launch one search batch of `num_items` entropies derived from `base_entropy` and
-/// `start_counter`, matching `prefix` (base32 chars of the leading `addr32`),
-/// sweeping salts `0..=max_salt`.
+/// `start_counter`, matching `addr32` against `targets`, sweeping salts
+/// `0..=max_salt` (first matching salt per key).
 pub fn search_batch(
     base_entropy: &[u8; ENTROPY_SIZE],
     start_counter: u64,
     num_items: u64,
     max_salt: u32,
-    prefix: &[u8],
+    targets: &[DeviceTarget],
     max_hits: usize,
 ) -> Result<BatchResult, CudaError> {
     #[cfg(not(cuda_built))]
@@ -267,7 +330,7 @@ pub fn search_batch(
             start_counter,
             num_items,
             max_salt,
-            prefix,
+            targets,
             max_hits,
         );
         Err(CudaError::NotBuilt)
@@ -275,6 +338,7 @@ pub fn search_batch(
 
     #[cfg(cuda_built)]
     {
+        assert!(targets.len() <= MAX_TARGETS);
         let stride = ENTROPY_SIZE + 1;
         let mut out = vec![0u8; max_hits * stride];
         let mut stub: core::ffi::c_int = 0;
@@ -286,8 +350,8 @@ pub fn search_batch(
                 start_counter,
                 num_items,
                 max_salt,
-                prefix.as_ptr(),
-                prefix.len() as core::ffi::c_int,
+                targets.as_ptr().cast(),
+                targets.len() as core::ffi::c_int,
                 out.as_mut_ptr(),
                 max_hits as core::ffi::c_int,
                 &mut stub,
@@ -311,5 +375,84 @@ pub fn search_batch(
             hits,
             kernel_is_stub: stub != 0,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Classic Algorand (Ed25519) accounts — cuda/ed25519_vanity.cu
+// ---------------------------------------------------------------------------
+
+/// Ed25519 seed length (the 32-byte mnemonic key of a classic account).
+pub const ED_SEED_SIZE: usize = 32;
+/// Ed25519 public key length (== the classic `addr32`).
+pub const ED_PK_SIZE: usize = 32;
+
+/// Debug/validation: device seed → public key for each seed. `fast = false`
+/// runs the vendored constant-time reference path (`ge_scalarmult_base`),
+/// `fast = true` the search path (variable-time table lookup + batched
+/// inversion). Returns `seeds.len() * ED_PK_SIZE` bytes.
+pub fn ed_dbg_pubkey(seeds: &[[u8; ED_SEED_SIZE]], fast: bool) -> Result<Vec<u8>, CudaError> {
+    #[cfg(not(cuda_built))]
+    {
+        let _ = (seeds, fast);
+        Err(CudaError::NotBuilt)
+    }
+    #[cfg(cuda_built)]
+    {
+        let n = seeds.len();
+        let flat: Vec<u8> = seeds.iter().flatten().copied().collect();
+        let mut out = vec![0u8; n * ED_PK_SIZE];
+        // SAFETY: flat is n*ED_SEED_SIZE bytes; out is n*ED_PK_SIZE bytes.
+        let rc = unsafe {
+            ffi::ed_cuda_dbg_pubkey(flat.as_ptr(), n as u64, fast as core::ffi::c_int, out.as_mut_ptr())
+        };
+        if rc < 0 {
+            return Err(CudaError::Runtime(rc));
+        }
+        Ok(out)
+    }
+}
+
+/// Launch one classic search batch: `num_items` seeds, each `base_seed` with
+/// the 8-byte LE counter `start_counter + i` (wrapping) in bytes `[24..32]`,
+/// matching the public key (== addr32) against `targets`. Returns up to
+/// `max_hits` matching seeds.
+pub fn ed_search_batch(
+    base_seed: &[u8; ED_SEED_SIZE],
+    start_counter: u64,
+    num_items: u64,
+    targets: &[DeviceTarget],
+    max_hits: usize,
+) -> Result<Vec<[u8; ED_SEED_SIZE]>, CudaError> {
+    #[cfg(not(cuda_built))]
+    {
+        let _ = (base_seed, start_counter, num_items, targets, max_hits);
+        Err(CudaError::NotBuilt)
+    }
+    #[cfg(cuda_built)]
+    {
+        assert!(targets.len() <= MAX_TARGETS);
+        let mut out = vec![0u8; max_hits * ED_SEED_SIZE];
+        // SAFETY: base_seed is 32 bytes; out is max_hits*ED_SEED_SIZE;
+        // targets is n_targets*4 u64.
+        let n = unsafe {
+            ffi::ed_cuda_search(
+                base_seed.as_ptr(),
+                start_counter,
+                num_items,
+                targets.as_ptr().cast(),
+                targets.len() as core::ffi::c_int,
+                out.as_mut_ptr(),
+                max_hits as core::ffi::c_int,
+            )
+        };
+        if n < 0 {
+            return Err(CudaError::Runtime(n));
+        }
+        Ok(out
+            .chunks_exact(ED_SEED_SIZE)
+            .take(n as usize)
+            .map(|c| c.try_into().unwrap())
+            .collect())
     }
 }

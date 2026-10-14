@@ -10,6 +10,7 @@
 //! See `docs/DESIGN.md`.
 
 pub mod address;
+pub mod classic;
 pub mod falcon;
 pub mod fast;
 pub mod mnemonic;
@@ -19,6 +20,7 @@ pub use address::{
     pq_address_preimage, sha512_256, Address, ENTROPY_SIZE, HASHID_PQ_ADDRESS, HASHID_PQ_KEY,
     SCHEME_F1,
 };
+pub use classic::{classic_address, ClassicKeypair, CLASSIC_SEED_SIZE};
 pub use mnemonic::{key_to_mnemonic, mnemonic_to_key};
 pub use falcon::{
     keygen_from_seed, pubkey_coeffs, verify_with_pubkey, FalconError, Keypair, N, PRIVKEY_SIZE,

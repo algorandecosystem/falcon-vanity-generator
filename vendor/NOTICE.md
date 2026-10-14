@@ -1,6 +1,6 @@
 # Vendored third-party sources
 
-Both trees are pinned to exact upstream commits for byte-exact reproducibility.
+All trees are pinned to exact upstream commits for byte-exact reproducibility.
 Re-fetch with the commands below and diff to verify integrity.
 
 ## vendor/falcon — Falcon `det1024` C reference
@@ -59,3 +59,25 @@ canonical    = lowest salt in 0..=255 with !IsEdwards25519Point(addr32)
 key-file format and the `--salt` flags are gone — tooling always signs with the
 canonical salt stored in the key file (consensus still accepts any salt carried
 in a `PQSig`).
+
+## vendor/ed25519-cuda — Ed25519 CUDA (classic accounts)
+
+- Upstream: https://github.com/solana-labs/solana-perf-libs (archived),
+  `src/cuda-ecc-ed25519/` — a CUDA port of https://github.com/orlp/ed25519
+  (ref10 field/group arithmetic + LibTomCrypt SHA-512).
+- Pinned commit: `233c4457fd8d425da99cb3db46b2be8eb8b98997` (see `ed25519-cuda/PINNED_COMMIT`)
+- License: **zlib** (orlp/ed25519, `ed25519-cuda/license.txt`) and
+  **Apache-2.0** (Solana Labs port, `ed25519-cuda/LICENSE.solana-perf-libs`).
+- Status: **compiled and linked** — `#include`d by `cuda/ed25519_vanity.cu`.
+  Files are byte-identical to upstream; our additions (variable-time base
+  table lookup, batched inversion, search driver) live in
+  `cuda/ed25519_vanity.cu`, not in the vendored files.
+
+```bash
+SHA=233c4457fd8d425da99cb3db46b2be8eb8b98997
+for f in common.cu fe.cu fe.h fixedint.h ge.cu ge.h precomp_data.h \
+         sha512.cu sha512.h license.txt ; do
+  curl -sSL "https://raw.githubusercontent.com/solana-labs/solana-perf-libs/$SHA/src/cuda-ecc-ed25519/$f" \
+    --create-dirs -o "vendor/ed25519-cuda/$f"
+done
+```
